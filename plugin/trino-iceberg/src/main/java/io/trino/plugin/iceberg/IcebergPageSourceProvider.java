@@ -72,6 +72,7 @@ import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplit;
+import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.DynamicFilter;
@@ -248,6 +249,7 @@ public class IcebergPageSourceProvider
             ConnectorSession session,
             ConnectorSplit connectorSplit,
             ConnectorTableHandle connectorTable,
+            Optional<ConnectorTableCredentials> credentials,
             List<ColumnHandle> columns,
             DynamicFilter dynamicFilter)
     {
@@ -289,9 +291,17 @@ public class IcebergPageSourceProvider
                 split.getFileRecordCount(),
                 split.getPartitionDataJson(),
                 split.getFileFormat(),
-                split.getFileIoProperties(),
+                getFileIoProperties(credentials),
                 split.getDataSequenceNumber(),
                 tableHandle.getNameMappingJson().map(NameMappingParser::fromJson));
+    }
+
+    private static Map<String, String> getFileIoProperties(Optional<ConnectorTableCredentials> credentials)
+    {
+        if (credentials.isPresent() && credentials.get() instanceof IcebergTableCredentials(Map<String, String> properties)) {
+            return properties;
+        }
+        return ImmutableMap.of();
     }
 
     public ConnectorPageSource createPageSource(

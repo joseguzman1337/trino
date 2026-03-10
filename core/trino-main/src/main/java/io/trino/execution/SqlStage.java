@@ -13,6 +13,7 @@
  */
 package io.trino.execution;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Multimap;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
@@ -24,16 +25,24 @@ import io.trino.Session;
 import io.trino.execution.StateMachine.StateChangeListener;
 import io.trino.execution.buffer.OutputBuffers;
 import io.trino.execution.scheduler.SplitSchedulerStats;
+import io.trino.metadata.Metadata;
 import io.trino.metadata.Split;
+import io.trino.metadata.TableHandle;
 import io.trino.node.InternalNode;
+import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.metrics.Metrics;
 import io.trino.sql.planner.PartitioningHandle;
 import io.trino.sql.planner.PlanFragment;
+import io.trino.sql.planner.SimplePlanVisitor;
 import io.trino.sql.planner.plan.DynamicFilterId;
 import io.trino.sql.planner.plan.ExchangeNode;
+import io.trino.sql.planner.plan.MergeWriterNode;
 import io.trino.sql.planner.plan.PlanNode;
 import io.trino.sql.planner.plan.PlanNodeId;
 import io.trino.sql.planner.plan.SimplePlanRewriter;
+import io.trino.sql.planner.plan.TableExecuteNode;
+import io.trino.sql.planner.plan.TableScanNode;
+import io.trino.sql.planner.plan.TableWriterNode;
 
 import java.util.HashSet;
 import java.util.List;
@@ -66,6 +75,7 @@ public final class SqlStage
 {
     private final Session session;
     private final StageStateMachine stateMachine;
+    private final Map<PlanNodeId, ConnectorTableCredentials> tableCredentials;
     private final RemoteTaskFactory remoteTaskFactory;
     private final NodeTaskMap nodeTaskMap;
     private final boolean summarizeTaskInfo;
@@ -82,6 +92,7 @@ public final class SqlStage
     private final Set<TaskId> tasksWithFinalInfo = new HashSet<>();
 
     public static SqlStage createSqlStage(
+            Metadata metadata,
             StageId stageId,
             PlanFragment fragment,
             Map<PlanNodeId, TableInfo> tables,
@@ -121,7 +132,8 @@ public final class SqlStage
                 remoteTaskFactory,
                 nodeTaskMap,
                 summarizeTaskInfo,
-                bucketCountProvider);
+                bucketCountProvider,
+                extractTableCredentials(session, metadata, fragment));
         sqlStage.initialize();
         return sqlStage;
     }
@@ -132,7 +144,8 @@ public final class SqlStage
             RemoteTaskFactory remoteTaskFactory,
             NodeTaskMap nodeTaskMap,
             boolean summarizeTaskInfo,
-            LocalExchangeBucketCountProvider bucketCountProvider)
+            LocalExchangeBucketCountProvider bucketCountProvider,
+            Map<PlanNodeId, ConnectorTableCredentials> tableCredentials)
     {
         this.session = requireNonNull(session, "session is null");
         this.stateMachine = stateMachine;
@@ -142,6 +155,15 @@ public final class SqlStage
         this.bucketCountProvider = requireNonNull(bucketCountProvider, "bucketCountProvider is null");
 
         this.outboundDynamicFilterIds = getOutboundDynamicFilters(stateMachine.getFragment());
+        this.tableCredentials = ImmutableMap.copyOf(tableCredentials);
+    }
+
+    private static Map<PlanNodeId, ConnectorTableCredentials> extractTableCredentials(Session session, Metadata metadata, PlanFragment fragment)
+    {
+        ImmutableMap.Builder<PlanNodeId, ConnectorTableCredentials> tableCredentialsBuilder = ImmutableMap.builder();
+        ConnectorTableCredentialsVisitor visitor = new ConnectorTableCredentialsVisitor(session, metadata, tableCredentialsBuilder);
+        fragment.getRoot().accept(visitor, null);
+        return tableCredentialsBuilder.buildOrThrow();
     }
 
     // this is a separate method to ensure that the `this` reference is not leaked during construction
@@ -284,6 +306,7 @@ public final class SqlStage
                 node,
                 speculative,
                 fragment,
+                tableCredentials,
                 splits,
                 outputBuffers,
                 nodeTaskMap.createPartitionedSplitCountTracker(node, taskId),
@@ -422,6 +445,67 @@ public final class SqlStage
                     node.getSources(),
                     node.getInputs(),
                     node.getOrderingScheme());
+        }
+    }
+
+    private static final class ConnectorTableCredentialsVisitor
+            extends SimplePlanVisitor<Void>
+    {
+        private final Metadata metadata;
+        private final Session session;
+        private final ImmutableMap.Builder<PlanNodeId, ConnectorTableCredentials> sink;
+
+        public ConnectorTableCredentialsVisitor(Session session, Metadata metadata, ImmutableMap.Builder<PlanNodeId, ConnectorTableCredentials> sink)
+        {
+            this.session = requireNonNull(session, "session is null");
+            this.metadata = requireNonNull(metadata, "metadata is null");
+            this.sink = requireNonNull(sink, "sink is null");
+        }
+
+        @Override
+        public Void visitMergeWriter(MergeWriterNode node, Void context)
+        {
+            TableWriterNode.MergeTarget target = node.getTarget();
+            metadata.getTableCredentials(session, target.getHandle().catalogHandle(), target.getHandle().connectorHandle())
+                    .ifPresent(value -> sink.put(node.getId(), value));
+            return null;
+        }
+
+        @Override
+        public Void visitTableExecute(TableExecuteNode node, Void context)
+        {
+            TableWriterNode.TableExecuteTarget target = node.getTarget();
+            metadata.getTableCredentials(session, target.getExecuteHandle().catalogHandle(), target.getExecuteHandle().connectorHandle())
+                    .ifPresent(value -> sink.put(node.getId(), value));
+            return null;
+        }
+
+        @Override
+        public Void visitTableWriter(TableWriterNode node, Void context)
+        {
+            switch (node.getTarget()) {
+                case TableWriterNode.MergeTarget mergeTarget -> metadata.getTableCredentials(session, mergeTarget.getHandle().catalogHandle(), mergeTarget.getHandle().connectorHandle())
+                        .ifPresent(credentials -> sink.put(node.getId(), credentials));
+                case TableWriterNode.RefreshMaterializedViewTarget materializedViewTarget -> metadata.getTableCredentials(session, materializedViewTarget.getTableHandle().catalogHandle(), materializedViewTarget.getTableHandle().connectorHandle())
+                        .ifPresent(credentials -> sink.put(node.getId(), credentials));
+                case TableWriterNode.TableExecuteTarget tableExecuteTarget -> metadata.getTableCredentials(session, tableExecuteTarget.getExecuteHandle().catalogHandle(), tableExecuteTarget.getExecuteHandle().connectorHandle())
+                        .ifPresent(credentials -> sink.put(node.getId(), credentials));
+                case TableWriterNode.CreateTarget createTarget -> metadata.getTableCredentials(session, createTarget.getHandle().catalogHandle(), createTarget.getHandle().connectorHandle())
+                        .ifPresent(credentials -> sink.put(node.getId(), credentials));
+                case TableWriterNode.InsertTarget insertTarget -> metadata.getTableCredentials(session, insertTarget.getHandle().catalogHandle(), insertTarget.getHandle().connectorHandle())
+                        .ifPresent(credentials -> sink.put(node.getId(), credentials));
+                default -> throw new IllegalArgumentException("Unsupported table writer node: " + node.getClass().getSimpleName());
+            }
+            return null;
+        }
+
+        @Override
+        public Void visitTableScan(TableScanNode node, Void context)
+        {
+            TableHandle table = node.getTable();
+            metadata.getTableCredentials(session, table.catalogHandle(), table.connectorHandle())
+                    .ifPresent(value -> sink.put(node.getId(), value));
+            return null;
         }
     }
 }
