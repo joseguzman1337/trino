@@ -41,6 +41,7 @@ import java.util.Optional;
 import static io.trino.SessionTestUtils.TEST_SESSION;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
+import static io.trino.spi.type.DecimalType.createDecimalType;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.VarcharType.VARCHAR;
 import static io.trino.spi.type.VarcharType.createVarcharType;
@@ -78,6 +79,23 @@ public class TestIgniteClient
             new DefaultQueryBuilder(RemoteQueryModifier.NONE),
             new DefaultIdentifierMapping(),
             RemoteQueryModifier.NONE);
+
+    @Test
+    public void testMapsDecimalWithNegativeScale()
+    {
+        JdbcTypeHandle typeHandle = new JdbcTypeHandle(
+                Types.DECIMAL,
+                Optional.of("DECIMAL"),
+                Optional.of(5),
+                Optional.of(-3),
+                Optional.empty(),
+                Optional.empty());
+
+        Optional<ColumnMapping> columnMapping = JDBC_CLIENT.toColumnMapping(SESSION, null, typeHandle);
+
+        assertThat(columnMapping).isPresent();
+        assertThat(columnMapping.orElseThrow().getType()).isEqualTo(createDecimalType(8, 0));
+    }
 
     @Test
     public void testImplementCount()
