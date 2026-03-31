@@ -282,11 +282,11 @@ public final class HttpPageBufferClient
     @Override
     public void close()
     {
-        boolean shouldDestroyTaskResults;
         Future<?> future;
         synchronized (this) {
-            shouldDestroyTaskResults = !closed;
-
+            if (closed) {
+                return;
+            }
             closed = true;
 
             future = this.future;
@@ -301,9 +301,7 @@ public final class HttpPageBufferClient
         }
 
         // destroy task results on the remote node; response is ignored
-        if (shouldDestroyTaskResults) {
-            destroyTaskResults();
-        }
+        destroyTaskResults();
     }
 
     public synchronized void scheduleRequest()
@@ -643,7 +641,9 @@ public final class HttpPageBufferClient
     {
         if (Throwables.getCausalChain(t).stream()
                 .anyMatch(e -> nullToEmpty(e.getMessage()).contains("exceeded maximum length"))) {
-            return new PageTooLargeException();
+            PageTooLargeException pageTooLargeException = new PageTooLargeException();
+            pageTooLargeException.addSuppressed(t);
+            return pageTooLargeException;
         }
         return t;
     }
